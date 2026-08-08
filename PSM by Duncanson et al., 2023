@@ -1,0 +1,135 @@
+library(ggplot2)
+library(terra)
+library(sf)
+library(dplyr)
+
+## !!! load Landcover data first
+landcover_rast <- Landcover
+landcover_crop <- crop(landcover_rast, ext(pts))
+lc_df <- as.data.frame(landcover_crop, xy = TRUE, na.rm = TRUE)
+colnames(lc_df) <- c("x", "y", "landcover")
+
+lc_df$landcover <- as.factor(lc_df$landcover)
+
+matched_sf <- st_as_sf(
+  as.data.frame(matched_df), 
+  coords = c("x", "y"), 
+  crs = 4326
+) %>%
+  mutate(
+    Group = factor(status, 
+                   levels = c(1, 0), 
+                   labels = c("Inside", "Outside"))
+  )
+
+hima_sf <- st_as_sf(hima_poly)
+bbox_sf <- st_as_sfc(st_bbox(matched_sf))
+
+lc_labels <- c(
+  "11"  = "Irrigated Croplands",
+  "14"  = "Rainfed Croplands",
+  "20"  = "Mosaic Cropland",
+  "30"  = "Mosaic Vegetation",
+  "40"  = "Evergreen Forest",
+  "50"  = "Closed Broadleaved",
+  "60"  = "Open Broadleaved",
+  "70"  = "Needleleaved Forest",
+  "90"  = "Open Needleleaved",
+  "100" = "Mixed Forest",
+  "110" = "Mosaic Shrubland",
+  "120" = "Mosaic Grassland",
+  "130" = "Shrubland",
+  "140" = "Grassland",
+  "150" = "Sparse Vegetation",
+  "160" = "Flooded Forest",
+  "170" = "Saline Flooded",
+  "180" = "Flooded Vegetation",
+  "190" = "Urban Areas",
+  "200" = "Bare Areas",
+  "210" = "Water Bodies",
+  "220" = "Snow and Ice",
+  "230" = "Unclassified"
+)
+
+lc_colors <- c(
+  "Irrigated Croplands" = "#aaefef",
+  "Rainfed Croplands"   = "#ffff63",
+  "Mosaic Cropland"     = "#dcef63",
+  "Mosaic Vegetation"   = "#cdcd64",
+  "Evergreen Forest"    = "#006300",
+  "Closed Broadleaved"  = "#009f00",
+  "Open Broadleaved"    = "#aac700",
+  "Needleleaved Forest" = "#003b00",
+  "Open Needleleaved"   = "#286300",
+  "Mixed Forest"        = "#788300",
+  "Mosaic Shrubland"    = "#8d9f00",
+  "Mosaic Grassland"    = "#bd9500",
+  "Shrubland"           = "#956300",
+  "Grassland"           = "#ffb431",
+  "Sparse Vegetation"   = "#ffebae",
+  "Flooded Forest"      = "#00785a",
+  "Saline Flooded"      = "#009578",
+  "Flooded Vegetation"  = "#00dc83",
+  "Urban Areas"         = "#c31300",
+  "Bare Areas"          = "#fff5d6",
+  "Water Bodies"        = "#0046c7",
+  "Snow and Ice"        = "#ffffff",
+  "Unclassified"        = "#743411"
+)
+
+lc_df$landcover_name <- factor(lc_labels[as.character(lc_df$landcover)], levels = unname(lc_labels))
+
+p_map_lc <- ggplot() +
+  geom_raster(data = lc_df, aes(x = x, y = y, fill = landcover_name), alpha = 0.45) +
+  scale_fill_manual(values = lc_colors, name = NULL, na.value = "transparent") +
+  
+  geom_sf(data = hima_sf, fill = NA, color = "#a50f15", size = 1.0) +
+  
+  geom_sf(
+    data = matched_sf, 
+    aes(color = Group), 
+    size = 0.1, 
+    alpha = 0.45
+  ) +
+  scale_color_manual(
+    name = NULL,
+    values = c("Inside" = "#002060", "Outside" = "#ff6600")
+  ) +
+  ggspatial::annotation_scale(location = "bl",
+                              height = unit(0.1, "cm"),
+                              text_cex = 0.5,
+                              line_width = 0.2,
+                              bar_cols = c("white", "gray80")) +
+  ggspatial::annotation_north_arrow(
+    location = "tr",
+    which_north = "true",
+    height = unit(0.25, "cm"),
+    width = unit(0.25, "cm"),
+    pad_x = unit(0.2, "in"),
+    pad_y = unit(0.2, "in"),
+    style = ggspatial::north_arrow_orienteering(text_size = 3)
+  ) +
+  coord_sf(crs = 4326, expand = FALSE) +
+  labs(
+    title = NULL,
+    x = "Longitude (°E)",
+    y = "Latitude (°N)"
+  ) +
+  
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title = element_blank(),
+    legend.position = "bottom",
+    legend.box = "vertical",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 5),
+    legend.key.height = unit(0.3, "lines"),
+    legend.key.width = unit(0.5, "lines"),
+    panel.grid.major = element_line(color = "gray80", linetype = "dotted"),
+    axis.title = element_blank(),
+    axis.text.x = element_text(size = 5),
+    axis.text.y = element_text(size = 5, angle = 90)
+  )+
+  guides(color = guide_legend(override.aes = list(size = 2)))
+
+print(p_map_lc)
