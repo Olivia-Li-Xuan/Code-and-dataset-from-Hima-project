@@ -2,6 +2,80 @@ library(ggplot2)
 library(terra)
 library(sf)
 library(dplyr)
+library(tidyr)
+library(MatchIt)
+library(lme4)
+library(lmerTest) 
+
+## !!! load hima_shp_path first
+hima_poly <- vect(hima_shp_path)
+hima_poly <- project(hima_poly, "EPSG:4326")
+
+pts <- vect(data_c, geom = c("x", "y"), crs = "EPSG:4326")
+
+pts_m <- project(pts, "EPSG:3857")
+hima_m <- project(hima_poly, "EPSG:3857")
+
+hima_inner <- buffer(hima_m, width = -200)
+hima_outer_buffer <- buffer(hima_m, width = 200)
+
+pts_m$zone <- "Exclude"
+
+in_inner <- is.related(pts_m, hima_inner, "intersects")
+pts_m$zone[in_inner] <- "Inside"
+
+in_outer_buf <- is.related(pts_m, hima_outer_buffer, "intersects")
+pts_m$zone[!in_outer_buf] <- "Outside"
+
+data_c$zone <- pts_m$zone
+
+exclude_lc <- c(11, 14, 20, 30, 190, 210, 220, 230)
+
+data_filtered <- data_c %>%
+  filter(zone %in% c("Inside", "Outside")) %>% 
+  filter(!landcover %in% exclude_lc) %>%      
+  mutate(status = ifelse(zone == "Inside", 1, 0))
+
+set.seed(123)
+
+psm_model <- matchit(
+  status ~ elevation + slope + Aspect + x + y, 
+  data = data_filtered, 
+  method = "nearest", 
+  exact = ~ landcover,
+  distance = "glm", 
+  ratio = 1, 
+  replace = FALSE 
+)
+
+matched_df <- match.data(psm_model)
+matched_df_clean <- as.data.frame(matched_df)
+
+
+npp_long <- matched_df_clean %>%
+  pivot_longer(
+    cols = starts_with("CASA_NPP_"),
+    names_to = "Year",
+    values_to = "NPP_Value"
+  ) %>%
+  mutate(
+    Year = as.numeric(gsub("CASA_NPP_", "", Year)),
+    Zone = ifelse(status == 1, "Inside (Hima)", "Outside (Control)")
+  )
+
+npp_summary_yearly <- npp_long %>%
+  group_by(Year, Zone) %>%
+  summarise(
+    Pixel_Count = n(),
+    Mean_NPP   = mean(NPP_Value, na.rm = TRUE),
+    SD_NPP     = sd(NPP_Value, na.rm = TRUE),
+    SE_NPP     = SD_NPP / sqrt(Pixel_Count),
+    Median_NPP = median(NPP_Value, na.rm = TRUE),
+    .groups    = "drop"
+  ) %>%
+  arrange(Year, Zone)
+
+print(npp_summary_yearly, n = Inf)
 
 ## !!! load Landcover data first
 landcover_rast <- Landcover
