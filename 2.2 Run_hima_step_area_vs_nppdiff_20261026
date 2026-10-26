@@ -1,0 +1,54 @@
+# ============================================================
+# 06_area_vs_nppdiff_scatter.R
+# Cross-Hima analysis covering ALL Himas (V1-V8) at once:
+#   - correlation test between Hima area and the (Inside-Outside)
+#     NPP difference (Pearson r, R^2, p, significance)
+#   - combined scatter figure with lm fit and annotations
+# Reads Area_vs_NPPdiff_all_Hima.csv (updated by the loop version
+# or by module 01 for each Hima) - no PSM re-run needed.
+# Usage: just run this file.
+# ============================================================
+
+MOD_DIR <- "E:/2 David Eldridge/1 Tasks-20260805/5 Results/0 20261020/run_hima_loop_audit_modules_V1-V8_20261020"
+source(file.path(MOD_DIR, "00_config_and_functions.R"))
+
+cross_fp <- file.path(out_dir, "Area_vs_NPPdiff_all_Hima.csv")
+if (!file.exists(cross_fp))
+  stop("Area_vs_NPPdiff_all_Hima.csv not found. Run the PSM (loop version or module 01) first.")
+cross <- read.csv(cross_fp, stringsAsFactors = FALSE)
+cross <- cross[order(cross$Hima), ]
+print(cross)
+
+ct  <- cor.test(cross$Area_km2, cross$Diff_Inside_minus_Outside, method = "pearson")
+r   <- as.numeric(ct$estimate); R2 <- r^2; pv <- ct$p.value
+sig <- dplyr::case_when(pv < 0.001 ~ "***", pv < 0.01 ~ "**", pv < 0.05 ~ "*", TRUE ~ "ns")
+message(sprintf(
+  "[CORRELATION] area vs (Inside-Outside): r = %.3f, R^2 = %.3f, p = %.3g (%s)  (n = %d Himas)",
+  r, R2, pv, sig, nrow(cross)))
+
+tot_n <- format(sum(cross$N_matched), big.mark = ",")
+xr    <- range(cross$Area_km2, na.rm = TRUE)
+yr    <- range(cross$Diff_Inside_minus_Outside, na.rm = TRUE)
+p_cross <- ggplot(cross, aes(x = Area_km2, y = Diff_Inside_minus_Outside)) +
+  geom_hline(yintercept = 0, color = "grey70", linewidth = 0.3) +
+  geom_point(color = "#002060", size = 2, alpha = 0.85) +
+  geom_text(aes(label = Hima), vjust = -1.3, size = 1.5, color = "#002060") +
+  geom_smooth(method = "lm", se = TRUE, color = "#ff6600", linewidth = 0.7,
+              fill = "#ff6600", alpha = 0.15, linetype = "dashed") +
+  annotate("text",
+           x = 500, y = -5,
+           label = paste0("n = ", nrow(cross),
+                          "\nR^2 = ", sprintf("%.3f", R2),
+                          "\np = ", signif(pv, 3)),
+           hjust = 0, vjust = 1, size = 2.6, color = "black", lineheight = 0.95) +
+  labs(x = expression(paste("Hima area (", km^2, ")")),
+       y = expression(paste("NPP difference (Inside - Outside) (g C m"^-2, " yr"^-1, ")")),
+       title = "Hima area vs inside-outside NPP difference") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        axis.text = element_text(size = 6),
+        axis.title = element_text(size = 6, face = "bold"))
+p_cross
+ggsave(file.path(out_dir, "All_Hima_Area_vs_NPPdiff.png"),
+       plot = p_cross, width = 11, height = 9, units = "cm", dpi = 600)
+message("Saved All_Hima_Area_vs_NPPdiff.png")
