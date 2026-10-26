@@ -1,0 +1,75 @@
+# ============================================================
+# 03_matched_map.R
+# Redraw / edit the matched-pixels map (on landcover) for ONE Hima,
+# directly from the saved matched pixels (no PSM re-run needed).
+# Usage: set HIMA_TAG, then run this file.
+# ============================================================
+
+MOD_DIR <- "E:/2 David Eldridge/1 Tasks-20260805/5 Results/0 20261020/run_hima_loop_audit_modules_V1-V8_20261020"
+source(file.path(MOD_DIR, "00_config_and_functions.R"))
+
+HIMA_TAG <- "V4_Hima_al-Ghada"   # <-- choose Hima here!!
+
+src <- build_src_list()[[HIMA_TAG]]
+if (is.null(src)) stop("No data source found for ", HIMA_TAG)
+lf <- locate_files(src)
+lc_raster <- rast(lf$lc_f)
+hima_poly <- project(vect(lf$shp_file), "EPSG:4326")
+
+matched_df <- read.csv(file.path(out_dir, paste0(HIMA_TAG, "_Matched_df.csv")),
+                       stringsAsFactors = FALSE)
+
+pts2 <- vect(matched_df, geom = c("x", "y"), crs = "EPSG:4326")
+crop_ext <- ext(pts2)
+crop_ext$xmin <- crop_ext$xmin - 0.01; crop_ext$xmax <- crop_ext$xmax + 0.01
+crop_ext$ymin <- crop_ext$ymin - 0.01; crop_ext$ymax <- crop_ext$ymax + 0.01
+landcover_crop <- crop(lc_raster, crop_ext)
+
+matched_df$bg_lc_val <- terra::extract(landcover_crop, pts2)[[2]]
+matched_df_clean <- matched_df %>%
+  filter(!is.na(bg_lc_val) & bg_lc_val > 0 & bg_lc_val <= 17)
+
+lc_df <- as.data.frame(landcover_crop, xy = TRUE, na.rm = TRUE)
+colnames(lc_df) <- c("x", "y", "landcover")
+lc_df <- lc_df %>% filter(!is.na(landcover) & landcover > 0 & landcover <= 17)
+lc_df$landcover_name <- lc_labels[as.character(lc_df$landcover)]
+present_levels <- intersect(unname(lc_labels), unique(lc_df$landcover_name))
+lc_df$landcover_name <- factor(lc_df$landcover_name, levels = present_levels)
+
+matched_sf <- st_as_sf(matched_df_clean, coords = c("x", "y"), crs = 4326) %>%
+  mutate(Group = factor(status, levels = c(1, 0), labels = c("Inside", "Outside")))
+hima_sf <- st_as_sf(hima_poly)
+
+p_map_lc <- ggplot() +
+  geom_raster(data = lc_df, aes(x = x, y = y, fill = landcover_name), alpha = 0.45) +
+  scale_fill_manual(values = lc_colors, name = NULL,
+                    na.value = "transparent", na.translate = FALSE) +
+  geom_sf(data = hima_sf, fill = NA, color = "#a50f15", linewidth = 0.8) +
+  geom_sf(data = matched_sf, aes(color = Group), size = 0.1, alpha = 0.45) +
+  scale_color_manual(name = NULL,
+                     values = c("Inside" = "#002060", "Outside" = "#ff6600")) +
+  ggspatial::annotation_scale(location = "bl", height = unit(0.1, "cm"),
+                              text_cex = 0.5, line_width = 0.2,
+                              bar_cols = c("white", "gray80")) +
+  ggspatial::annotation_north_arrow(location = "tr", which_north = "true",
+                                    height = unit(0.25, "cm"), width = unit(0.25, "cm"),
+                                    pad_x = unit(0.2, "in"), pad_y = unit(0.2, "in"),
+                                    style = ggspatial::north_arrow_orienteering(text_size = 3)) +
+  coord_sf(crs = 4326, expand = FALSE) +
+  labs(x = "Longitude (E)", y = "Latitude (N)") +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_blank(), legend.position = c(0.1, 0.15),
+        legend.background = element_rect(), legend.title = element_blank(),
+        legend.text = element_text(size = 4),
+        legend.key.height = unit(0.2, "cm"), legend.key.width = unit(0.3, "cm"),
+        legend.box = "vertical", legend.spacing.y = unit(-0.15, "cm"),
+        legend.box.spacing = unit(0.01, "cm"),
+        legend.box.margin = margin(0, 0, 0, 0, unit = "cm"),
+        panel.grid.major = element_line(color = "gray80", linetype = "dotted"),
+        axis.title = element_blank(), axis.text.x = element_text(size = 5),
+        axis.text.y = element_text(size = 5, angle = 90, hjust = 0.5)) +
+  guides(color = guide_legend(override.aes = list(size = 2)))
+
+ggsave(file.path(out_dir, paste0(HIMA_TAG, "_Matched_Map.png")),
+       plot = p_map_lc, width = 11.5, height = 12.5, units = "cm", dpi = 600)
+message("[DONE] map saved: ", HIMA_TAG, "_Matched_Map.png")
