@@ -1,0 +1,62 @@
+# ============================================================
+# 02_barchart_MeanNPP.R
+# Redraw / edit the Inside-vs-Outside NPP barchart for ONE Hima,
+# directly from the saved matched pixels (no PSM re-run needed).
+# Usage: set HIMA_TAG, then run this file.
+# ============================================================
+
+MOD_DIR <- "E:/2 David Eldridge/1 Tasks-20260805/5 Results/0 20261020/run_hima_loop_audit_modules_V1-V8_20261020"
+source(file.path(MOD_DIR, "00_config_and_functions.R"))
+
+HIMA_TAG <- "V4_Hima_al-Ghada"   # <-- choose Hima here!!
+
+matched_df <- read.csv(file.path(out_dir, paste0(HIMA_TAG, "_Matched_df.csv")),
+                       stringsAsFactors = FALSE)
+matched_df$Zone <- factor(ifelse(matched_df$status == 1, "Inside", "Outside"),
+                          levels = c("Inside", "Outside"))
+
+# matching-weighted means +/- SD (identical estimator to the loop version)
+pixel_multiyear <- matched_df %>%
+  filter(!is.na(NPP_Mean_2017_2025), !is.na(weights), weights > 0) %>%
+  group_by(Zone) %>%
+  summarise(Mean_NPP = wmean(NPP_Mean_2017_2025, weights),
+            SD_NPP   = wsd(NPP_Mean_2017_2025, weights),
+            .groups  = "drop") %>%
+  mutate(ymin = Mean_NPP - SD_NPP, ymax = Mean_NPP + SD_NPP)
+
+fit_w <- lm(NPP_Mean_2017_2025 ~ Zone, data = matched_df, weights = weights)
+p_val <- summary(fit_w)$coefficients["ZoneOutside", "Pr(>|t|)"]
+p_lab <- dplyr::case_when(p_val < 0.001 ~ "***", p_val < 0.01 ~ "**",
+                          p_val < 0.05 ~ "*", TRUE ~ "ns")
+message(sprintf("Mean NPP Inside=%.2f Outside=%.2f  p=%.3g (%s)",
+                pixel_multiyear$Mean_NPP[1], pixel_multiyear$Mean_NPP[2], p_val, p_lab))
+
+y_top <- max(pixel_multiyear$ymax, na.rm = TRUE)
+stat_overall <- data.frame(x_pos = 1.5, y_position = y_top * 1.06, label = p_lab)
+lab_df <- pixel_multiyear %>%
+  mutate(lab = sprintf("%.2f", Mean_NPP), lab_y = ymax * 1.02)
+
+p_overall <- ggplot(pixel_multiyear, aes(x = Zone, y = Mean_NPP, fill = Zone, color = Zone)) +
+  geom_col(width = 0.5, alpha = 0.85) +
+  geom_text(data = lab_df, aes(x = Zone, y = lab_y, label = lab),
+            inherit.aes = FALSE, color = "black", size = 2.5, fontface = "bold") +
+  geom_errorbar(aes(ymin = ymin, ymax = ymax), width = 0.15,
+                linewidth = 0.4, color = "black", alpha = 0.8) +
+  geom_text(data = stat_overall, aes(x = x_pos, y = y_position, label = label),
+            inherit.aes = FALSE, size = 3, fontface = "bold", color = "black") +
+  scale_color_manual(values = c("Inside" = "#002060", "Outside" = "#ff6600")) +
+  scale_fill_manual(values  = c("Inside" = "#002060", "Outside" = "#ff6600")) +
+  labs(x = NULL,
+       y = expression(paste("Net Primary Productivity (g C m"^-2, " yr"^-1, ")")),
+       title = NULL) +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "grey92", linewidth = 0.1, linetype = "dashed"),
+        axis.text.x = element_text(color = "black", size = 6, face = "bold"),
+        axis.text.y = element_text(color = "black", size = 5),
+        axis.title  = element_text(color = "black", size = 5, face = "bold"),
+        legend.position = "none")
+
+ggsave(file.path(out_dir, paste0(HIMA_TAG, "_Barchart_MeanNPP.png")),
+       plot = p_overall, width = 8, height = 5, units = "cm", dpi = 600)
+message("[DONE] barchart saved: ", HIMA_TAG, "_Barchart_MeanNPP.png")
