@@ -1,0 +1,456 @@
+# ============================================================
+# 00_config_and_functions.R
+# Shared configuration + functions for ALL modules (V1-V8).
+# Every other module starts with:  source(this file)
+# Functionality is IDENTICAL to the loop version
+# (run_hima_loop_audit_loop_20261020.R) - only the code is
+# organised into independently runnable modules.
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(terra)
+  library(dplyr)
+  library(tidyr)
+  library(MatchIt)
+  library(ggplot2)
+  library(sf)
+  library(ggspatial)
+})
+
+ws      <- "E:/2 David Eldridge/1 Tasks-20260805/6 Workshop"
+root    <- "E:/2 David Eldridge/1 Tasks-20260805"
+out_dir <- file.path(root, "5 Results", "0 20261020")
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+# ---------------- all Himas (V1-V8) ----------------
+ALL_TAGS <- c("V1_Hima_V1", "V2_Hima_V2", "V3_Hima_V3",
+              "V4_Hima_al-Ghada", "V5_Hima_Thumalah", "V6_Hima_Quraysh",
+              "V7_Hima_Saysad", "V8_Hima_Huraymila")
+
+# ---------------- data sources: V1-V3 (split-folder layout) ----------------
+#   "1 SHP file" / "2 NPP" / "3 Other factors", one subfolder per Hima;
+#   landcover = MODIS MCD12Q1 LC_Type1 Natural 17_25 (identical to the
+#   original V1-V3 extract codes), NPP = CASA_NPP_Mean_2017_2025.tif
+v123_sources <- list(
+  "V1_Hima_V1" = list(
+    shp_dir  = file.path(root, "1 SHP file",      "1 Hima_V1"),
+    npp_dir  = file.path(root, "2 NPP",           "2 Hima_V1"),
+    fact_dir = file.path(root, "3 Other factors", "1 Hima_V1")),
+  "V2_Hima_V2" = list(
+    shp_dir  = file.path(root, "1 SHP file",      "2 Hima_V2"),
+    npp_dir  = file.path(root, "2 NPP",           "2 Hima_v2"),
+    fact_dir = file.path(root, "3 Other factors", "2 Hima_V2")),
+  "V3_Hima_V3" = list(
+    shp_dir  = file.path(root, "1 SHP file",      "3 Hima_V3"),
+    npp_dir  = file.path(root, "2 NPP",           "2 Hima_V3"),
+    fact_dir = file.path(root, "3 Other factors", "3 Hima_V3"))
+)
+
+# build the unified source table: V1-V3 + V4-V8 (workshop layout)
+build_src_list <- function() {
+  src_list <- v123_sources
+  for (d in list.dirs(ws, recursive = FALSE)) {
+    if (!grepl("^[0-9]+ Hima", basename(d))) next
+    vnum  <- as.integer(sub("^([0-9]+) .*", "\\1", basename(d)))
+    hname <- sub("^[0-9]+ ", "", basename(d))
+    tag   <- sprintf("V%d_%s", vnum, gsub(" ", "_", hname))
+    src_list[[tag]] <- list(ws_dir = d)
+  }
+  src_list
+}
+
+# locate the input rasters / shapefile for one Hima
+locate_files <- function(src) {
+  if (!is.null(src$ws_dir)) {                # V4-V8 : workshop layout
+    d        <- src$ws_dir
+    shp_file <- list.files(file.path(d, "1 shp"),      pattern="\\.shp$", full.names=TRUE)[1]
+    npp_file <- list.files(file.path(d, "3 NPP-mean"), pattern="\\.tif$", full.names=TRUE)[1]
+    fac_dir  <- file.path(d, "2 factors")
+    aspect_f <- list.files(fac_dir, pattern="Aspect.*\\.tif$",    full.names=TRUE)[1]
+    elev_f   <- list.files(fac_dir, pattern="elevation.*\\.tif$", full.names=TRUE)[1]
+    slope_f  <- list.files(fac_dir, pattern="slope.*\\.tif$",     full.names=TRUE)[1]
+    lc_f     <- list.files(fac_dir, pattern="MCD12Q1.*\\.tif$",   full.names=TRUE)[1]
+  } else {                                   # V1-V3 : original split layout
+    shp_file <- list.files(src$shp_dir, pattern="\\.shp$", full.names=TRUE)[1]
+    npp_file <- list.files(src$npp_dir, pattern="CASA_NPP_Mean_2017_2025\\.tif$",
+                           full.names=TRUE, recursive=TRUE)[1]
+    fac_dir  <- src$fact_dir
+    aspect_f <- list.files(fac_dir, pattern="WAPOR_Aspect.*\\.tif$",    full.names=TRUE)[1]
+    elev_f   <- list.files(fac_dir, pattern="WAPOR_elevation.*\\.tif$", full.names=TRUE)[1]
+    slope_f  <- list.files(fac_dir, pattern="WAPOR_slope.*\\.tif$",     full.names=TRUE)[1]
+    lc_f     <- list.files(fac_dir, pattern="MCD12Q1_LC_Type1_Natural_17_25\\.tif$",
+                           full.names=TRUE)[1]
+  }
+  stopifnot(!any(is.na(c(shp_file, npp_file, aspect_f, elev_f, slope_f, lc_f))))
+  list(shp_file = shp_file, npp_file = npp_file, fac_dir = fac_dir,
+       aspect_f = aspect_f, elev_f = elev_f, slope_f = slope_f, lc_f = lc_f)
+}
+
+# ---------------- design knowledge used by the reviewer ----------------
+# topography is strictly pre-treatment -> valid confounders
+pre_treatment_vars <- c("Elevation", "Slope", "Northness", "Eastness")
+# land cover may be altered BY protection status -> candidate mediator,
+# therefore it must NOT enter the propensity score model (it is only used
+# as an exact-matching stratum, i.e. stratified comparison)
+post_treatment_risk <- "Landcover"
+
+# diagnostic thresholds
+SMD_OK      <- 0.10
+VR_LOW      <- 0.50
+VR_HIGH     <- 2.00
+LOSS_MAX    <- 0.25   # max acceptable share of dropped treated units
+OVERLAP_OK  <- 0.70   # advisory overlap coefficient after matching
+
+# ---------------------------------------------------------------------------
+# Helper: variance inflation factors (no extra package needed)
+# ---------------------------------------------------------------------------
+vif_manual <- function(d) {
+  vars <- names(d)
+  out <- sapply(vars, function(v) {
+    others <- setdiff(vars, v)
+    if (!length(others)) return(NA_real_)
+    f <- as.formula(paste(v, "~", paste(others, collapse = " + ")))
+    r2 <- tryCatch(summary(lm(f, data = d))$r.squared, error = function(e) NA_real_)
+    if (is.na(r2) || r2 >= 0.999999) return(NA_real_)
+    1 / (1 - r2)
+  })
+  out
+}
+
+# ---------------------------------------------------------------------------
+# adaptive boundary-band width : narrowest width of the Hima (metres)
+# rotating-caliper minimum width on the convex hull, projected to a local
+# azimuthal-equidistant CRS so distances are in metres and zone-independent.
+# The boundary band on each side may not exceed 1/3 of this width; the default
+# 100 m is kept unless the Hima is narrower than 3 * 100 m.
+# ---------------------------------------------------------------------------
+compute_min_width_m <- function(poly_ll) {
+  cc  <- crds(centroids(poly_ll))[1, ]                       # lon0, lat0
+  aeqd <- paste0("+proj=aeqd +lat_0=", cc[2], " +lon_0=", cc[1],
+                 " +datum=WGS84 +units=m +no_defs")
+  poly_m <- project(poly_ll, aeqd)
+  hull   <- suppressWarnings(convHull(poly_m))                # convex hull (handles holes / multipart)
+  pts    <- crds(hull); pts <- pts[!duplicated(round(pts, 2)), , drop = FALSE]
+  if (!is.matrix(pts) || nrow(pts) < 3) pts <- crds(poly_m)
+  pts    <- pts[!duplicated(round(pts, 2)), , drop = FALSE]
+  if (nrow(pts) < 3) return(NA_real_)
+  angles <- seq(0, 180, by = 0.5) * pi / 180
+  best   <- Inf
+  for (a in angles) {
+    u   <- c(cos(a), sin(a))
+    pr  <- pts %*% u
+    w   <- max(pr) - min(pr)
+    if (w < best) best <- w
+  }
+  best
+}
+
+# ---------------------------------------------------------------------------
+# STEP 1 : pre-match review of covariates and MatchIt parameters
+# ---------------------------------------------------------------------------
+review_design <- function(df, ps_vars, exact_var, treat_var) {
+  lines <- character(0)
+  add <- function(...) lines <<- c(lines, sprintf(...))
+
+  n_t <- sum(df[[treat_var]] == 1)
+  n_c <- sum(df[[treat_var]] == 0)
+
+  add("---- 1. COVARIATE REVIEW -------------------------------------")
+  add("PS model covariates: %s", paste(ps_vars, collapse = ", "))
+  add("Exact-matching stratum: %s", exact_var)
+
+  # a) role of each variable (confounder / mediator / collider)
+  for (v in ps_vars) {
+    if (v %in% pre_treatment_vars) {
+      add("  [OK] %-10s : pre-treatment topographic variable -> valid confounder", v)
+    } else if (v %in% post_treatment_risk) {
+      add("  [!!] %-10s : may be affected by treatment -> mediator risk, REMOVE from PS model", v)
+    } else {
+      add("  [??] %-10s : role not documented, check manually", v)
+    }
+  }
+  if (exact_var %in% post_treatment_risk) {
+    add("  [NOTE] %s is kept only as an exact-matching stratum and is NOT in the",
+        exact_var)
+    add("         PS model. That is the correct way to use a possible mediator:")
+    add("         within-stratum comparison avoids mediator / collider bias.")
+  }
+  # outcome leakage check
+  if (any(grepl("NPP", ps_vars, ignore.case = TRUE))) {
+    add("  [!!] outcome-derived variable detected in the PS model -> must be removed")
+  } else {
+    add("  [OK] no outcome (NPP) variable enters the PS model")
+  }
+
+  # b) collinearity among covariates (sampled for speed)
+  samp_n <- min(nrow(df), 200000)
+  ds <- df[sample(nrow(df), samp_n), , drop = FALSE]
+  num_vars <- ps_vars[sapply(ds[ps_vars], is.numeric)]
+  num_vars <- num_vars[!grepl("I\\(|:", num_vars)]     # drop polynomial/interaction terms
+  if (length(num_vars) > 1) {
+    cm <- cor(ds[num_vars], use = "pairwise.complete.obs")
+    add("")
+    add("  Correlation matrix (|r|>0.80 flagged):")
+    hi <- which(abs(cm) > 0.80 & upper.tri(cm), arr.ind = TRUE)
+    for (i in seq_len(nrow(hi))) {
+      add("    [!!] %s ~ %s : r = %.2f", num_vars[hi[i, 1]], num_vars[hi[i, 2]],
+          cm[hi[i, 1], hi[i, 2]])
+    }
+    if (!nrow(hi)) add("    [OK] no pair with |r| > 0.80")
+    vifs <- vif_manual(ds[num_vars])
+    add("  VIF: %s", paste(sprintf("%s=%.2f", names(vifs), vifs), collapse = ", "))
+    if (any(vifs > 5, na.rm = TRUE)) {
+      add("    [!!] VIF > 5 -> collinearity, but polynomial terms are collinear by")
+      add("         construction; monitor variance ratios, do not drop blindly")
+    } else {
+      add("    [OK] all VIF <= 5")
+    }
+  }
+
+  # c) parameter / sample-size adequacy
+  add("")
+  add("---- 2. PARAMETER REVIEW -------------------------------------")
+  add("  Sample: treated (Inside) = %s, control (Outside) = %s, ratio C/T = %.1f",
+      format(n_t, big.mark = ","), format(n_c, big.mark = ","), n_c / n_t)
+  add("  method = nearest, distance = glm (logistic PS), replace = FALSE, ratio = 1")
+  if (n_c / n_t >= 5) {
+    add("  [OK] controls are abundant -> ratio = 1 is feasible; a larger ratio")
+    add("       would reduce variance and is kept as a remediation option")
+  } else if (n_c / n_t < 2) {
+    add("  [!!] few controls per treated unit -> ratio > 1 is NOT feasible,")
+    add("       replace = TRUE is kept as the remediation option")
+  }
+  add("  caliper = 0.25 SD of the PS (+ Slope-specific caliper 0.3): standard")
+  add("  practice is 0.20 SD; because N is large here the caliper mainly")
+  add("  controls bias, tightening it is a valid remediation step.")
+  add("  [NOTE] squared terms I(Elevation^2), I(Slope^2) are already included to")
+  add("         absorb non-linear PS specification; interactions are added only")
+  add("         if diagnostics show residual imbalance.")
+  add("")
+  lines
+}
+
+# ---------------------------------------------------------------------------
+# STEP 2 : post-match diagnostics
+# ---------------------------------------------------------------------------
+overlap_coef <- function(a, b, n = 512) {
+  a <- a[is.finite(a)]; b <- b[is.finite(b)]
+  if (length(a) < 10 || length(b) < 10) return(NA_real_)
+  x <- seq(min(c(a, b)), max(c(a, b)), length.out = n)
+  d1 <- density(a, n = n); d2 <- density(b, n = n)
+  y1 <- approx(d1$x, d1$y, xout = x, rule = 2)$y
+  y2 <- approx(d2$x, d2$y, xout = x, rule = 2)$y
+  y1[is.na(y1)] <- 0; y2[is.na(y2)] <- 0
+  if (sum(pmax(y1, y2)) == 0) return(NA_real_)
+  sum(pmin(y1, y2)) / sum(pmax(y1, y2))
+}
+
+diagnose_match <- function(m, tag, round_i, spec, out_dir) {
+  s <- summary(m, standardize = TRUE, interactions = FALSE)
+  get_col <- function(d, pat) {
+    nm <- grep(pat, colnames(d), value = TRUE, ignore.case = TRUE)
+    if (!length(nm)) return(rep(NA_real_, nrow(d)))
+    as.numeric(d[[nm[1]]])
+  }
+  sa <- as.data.frame(s$sum.all)
+  sm <- as.data.frame(s$sum.matched)
+
+  bal <- data.frame(
+    variable    = rownames(sm),
+    SMD_before  = get_col(sa, "Std. Mean Diff"),
+    SMD_after   = get_col(sm, "Std. Mean Diff"),
+    VR_before   = get_col(sa, "Var. Ratio"),
+    VR_after    = get_col(sm, "Var. Ratio"),
+    stringsAsFactors = FALSE
+  )
+  bal <- bal[!is.na(bal$SMD_after), ]
+  bal$is_distance <- bal$variable == "distance"
+
+  # covariate balance (propensity score itself reported separately)
+  cov_bal <- bal[!bal$is_distance, ]
+  max_smd_b <- max(abs(cov_bal$SMD_before), na.rm = TRUE)
+  max_smd_a <- max(abs(cov_bal$SMD_after),  na.rm = TRUE)
+  n_bad_smd <- sum(abs(cov_bal$SMD_after) > SMD_OK, na.rm = TRUE)
+  bad_vars  <- cov_bal$variable[abs(cov_bal$SMD_after) > SMD_OK]
+
+  vr_a <- cov_bal$VR_after[is.finite(cov_bal$VR_after) & cov_bal$VR_after > 0]
+  vr_min <- if (length(vr_a)) min(vr_a) else NA_real_
+  vr_max <- if (length(vr_a)) max(vr_a) else NA_real_
+  n_bad_vr <- sum(vr_a < VR_LOW | vr_a > VR_HIGH)
+
+  # sample accounting
+  w  <- m$weights
+  tt <- m$treat == 1
+  n_t <- sum(tt); n_c <- sum(!tt)
+  t_kept <- sum(w > 0 & tt); c_kept <- sum(w > 0 & !tt)
+  loss_t <- 1 - t_kept / n_t
+  loss_c <- 1 - c_kept / n_c
+
+  # propensity score / common support
+  ps <- m$distance
+  ov_before <- overlap_coef(ps[tt], ps[!tt])
+  ov_after  <- overlap_coef(ps[tt & w > 0], ps[!tt & w > 0])
+  lo <- max(min(ps[tt]),  min(ps[!tt]))
+  hi <- min(max(ps[tt]),  max(ps[!tt]))
+  in_support <- if (hi > lo) mean(ps[tt] >= lo & ps[tt] <= hi) else 0
+
+  pass_smd  <- n_bad_smd == 0
+  pass_vr   <- n_bad_vr == 0
+  pass_loss <- loss_t <= LOSS_MAX
+  pass_all  <- pass_smd && pass_vr && pass_loss
+
+  # ---- artefacts -----------------------------------------------------------
+  bal$round <- round_i
+  write.csv(bal, file.path(out_dir, paste0(tag, "_balance_round", round_i, ".csv")),
+            row.names = FALSE)
+
+  love <- bal %>%
+    select(variable, before = SMD_before, after = SMD_after) %>%
+    pivot_longer(cols = c(before, after), names_to = "stage", values_to = "SMD") %>%
+    mutate(stage = factor(stage, levels = c("before", "after"),
+                          labels = c("Before matching", "After matching")))
+  p_love <- ggplot(love, aes(x = SMD, y = variable, group = variable)) +
+    geom_vline(xintercept = c(-SMD_OK, SMD_OK), linetype = "dashed", color = "grey40") +
+    geom_vline(xintercept = 0, color = "grey70") +
+    geom_line(color = "grey60") +
+    geom_point(aes(shape = stage, color = stage), size = 1.8) +
+    scale_color_manual(values = c("Before matching" = "#ff6600", "After matching" = "#002060")) +
+    scale_shape_manual(values = c("Before matching" = 1, "After matching" = 19)) +
+    labs(x = "Standardized mean difference", y = NULL,
+         title = paste0(tag, "  round ", round_i, "  |  max|SMD| after = ",
+                        sprintf("%.3f", max_smd_a))) +
+    theme_bw(base_size = 9) +
+    theme(legend.title = element_blank(),
+          legend.position = "bottom",
+          panel.grid.minor = element_blank())
+  ggsave(file.path(out_dir, paste0(tag, "_LovePlot_round", round_i, ".png")),
+         plot = p_love, width = 12, height = max(5, 1.2 + 0.35 * nrow(bal)),
+         units = "cm", dpi = 400)
+
+  samp <- function(x, k = 200000) if (length(x) > k) sample(x, k) else x
+  ps_df <- rbind(
+    data.frame(stage = "Before matching",
+               ps = samp(ps[tt]), group = "Inside"),
+    data.frame(stage = "Before matching",
+               ps = samp(ps[!tt]), group = "Outside"),
+    data.frame(stage = "After matching",
+               ps = samp(ps[tt & w > 0]), group = "Inside"),
+    data.frame(stage = "After matching",
+               ps = samp(ps[!tt & w > 0]), group = "Outside"))
+  p_ps <- ggplot(ps_df, aes(x = ps, fill = group)) +
+    geom_density(alpha = 0.45, color = NA) +
+    facet_wrap(~ stage, scales = "free_y") +
+    scale_fill_manual(values = c("Inside" = "#002060", "Outside" = "#ff6600")) +
+    labs(x = "Propensity score", y = "Density",
+         title = paste0(tag, "  round ", round_i,
+                        "  |  overlap before = ", sprintf("%.2f", ov_before),
+                        "   overlap after = ", sprintf("%.2f", ov_after))) +
+    theme_bw(base_size = 9) +
+    theme(legend.title = element_blank(), panel.grid.minor = element_blank())
+  ggsave(file.path(out_dir, paste0(tag, "_PSdistribution_round", round_i, ".png")),
+         plot = p_ps, width = 14, height = 7, units = "cm", dpi = 400)
+
+  list(
+    round          = round_i,
+    spec           = spec,
+    balance        = bal,
+    max_smd_before = max_smd_b,
+    max_smd_after  = max_smd_a,
+    n_bad_smd      = n_bad_smd,
+    bad_vars       = bad_vars,
+    vr_min         = vr_min,
+    vr_max         = vr_max,
+    n_bad_vr       = n_bad_vr,
+    overlap_before = ov_before,
+    overlap_after  = ov_after,
+    pct_in_support = in_support,
+    n_treated      = n_t,
+    n_control      = n_c,
+    n_matched      = sum(w > 0),
+    loss_treated   = loss_t,
+    loss_control   = loss_c,
+    pass_smd       = pass_smd,
+    pass_vr        = pass_vr,
+    pass_loss      = pass_loss,
+    pass_all       = pass_all
+  )
+}
+
+# ---------------------------------------------------------------------------
+# diagnostic report text for one round
+# ---------------------------------------------------------------------------
+diag_text <- function(dg) {
+  c(
+    sprintf("  Round %d  --  %s", dg$round, dg$spec$label),
+    sprintf("      PS formula : %s", paste(deparse(dg$spec$formula), collapse = "")),
+    sprintf("      exact = %s | method = %s | distance = %s | caliper = %s | ratio = %d | replace = %s",
+            paste(deparse(dg$spec$exact), collapse = ""), dg$spec$method, dg$spec$distance,
+            paste(dg$spec$caliper, collapse = ", "), dg$spec$ratio, dg$spec$replace),
+    sprintf("      max |SMD| before = %.3f  ->  after = %.3f   (%s)",
+            dg$max_smd_before, dg$max_smd_after,
+            ifelse(dg$pass_smd, "PASS, all < 0.10",
+                   paste0("FAIL, unbalanced: ", paste(dg$bad_vars, collapse = ", ")))),
+    sprintf("      variance ratio after : min = %.2f, max = %.2f   (%s)",
+            dg$vr_min, dg$vr_max,
+            ifelse(dg$pass_vr, "PASS, within 0.50-2.00", "FAIL, outside 0.50-2.00")),
+    sprintf("      PS overlap : before = %.2f, after = %.2f ; treated inside common support = %.1f%%",
+            dg$overlap_before, dg$overlap_after, 100 * dg$pct_in_support),
+    sprintf("      sample : treated %s / control %s ; matched %s ; dropped treated %.1f%%, dropped control %.1f%%   (%s)",
+            format(dg$n_treated, big.mark = ","), format(dg$n_control, big.mark = ","),
+            format(dg$n_matched, big.mark = ","), 100 * dg$loss_treated,
+            100 * dg$loss_control,
+            ifelse(dg$pass_loss, "PASS", "FAIL, >25% of treated units lost")),
+    sprintf("      VERDICT : %s", ifelse(dg$pass_all, "ACCEPTED", "NOT ACCEPTED"))
+  )
+}
+
+# ---------------------------------------------------------------------------
+# MODIS IGBP labels & colors
+# ---------------------------------------------------------------------------
+lc_labels <- c(
+  "1"  = "Evergreen Needleleaf Forests",       "2"  = "Evergreen Broadleaf Forests",
+  "3"  = "Deciduous Needleleaf Forests",       "4"  = "Deciduous Broadleaf Forests",
+  "5"  = "Mixed Forests",                      "6"  = "Closed Shrublands",
+  "7"  = "Open Shrublands",                    "8"  = "Woody Savannas",
+  "9"  = "Savannas",                           "10" = "Grasslands",
+  "11" = "Permanent Wetlands",                 "12" = "Croplands",
+  "13" = "Urban and Built-up Lands",           "14" = "Cropland/Natural Vegetation Mosaics",
+  "15" = "Permanent Snow and Ice",             "16" = "Barren",
+  "17" = "Water Bodies")
+lc_colors <- c(
+  "Evergreen Needleleaf Forests"        = "#05450a", "Evergreen Broadleaf Forests"  = "#086a10",
+  "Deciduous Needleleaf Forests"        = "#54a708", "Deciduous Broadleaf Forests"  = "#78d203",
+  "Mixed Forests"                       = "#009900", "Closed Shrublands"            = "#c6b044",
+  "Open Shrublands"                     = "#dcd159", "Woody Savannas"               = "#dade48",
+  "Savannas"                            = "#fbff13", "Grasslands"                   = "#b6ff05",
+  "Permanent Wetlands"                  = "#27ffe7", "Croplands"                    = "#c24f44",
+  "Urban and Built-up Lands"            = "#a5a5a5", "Cropland/Natural Vegetation Mosaics" = "#ff6d4c",
+  "Permanent Snow and Ice"              = "#69fff8", "Barren"                       = "#f9ffa4",
+  "Water Bodies"                        = "#1c0dff")
+exclude_lc <- c(12, 13, 14, 15, 17)
+
+# ---------------------------------------------------------------------------
+# matching-weight effect estimators (essential when ratio > 1 or replace=TRUE)
+# ---------------------------------------------------------------------------
+wmean <- function(x, w) weighted.mean(x, w, na.rm = TRUE)
+wsd   <- function(x, w) {
+  ok <- !is.na(x); m <- weighted.mean(x[ok], w[ok])
+  sqrt(sum(w[ok] * (x[ok] - m)^2) / sum(w[ok]))
+}
+
+# ---------------------------------------------------------------------------
+# merge helper: combine new rows with previous results in out_dir so that
+# re-running one Hima (or a subset) never erases the other Himas' results.
+# Rows of Himas processed now REPLACE their older stored versions.
+# ---------------------------------------------------------------------------
+merge_with_existing <- function(new_df, csv_name, key = "Hima") {
+  fp <- file.path(out_dir, csv_name)
+  if (file.exists(fp)) {
+    old <- tryCatch(read.csv(fp, stringsAsFactors = FALSE), error = function(e) NULL)
+    if (!is.null(old) && nrow(old) > 0 && key %in% names(old)) {
+      old <- old[!old[[key]] %in% new_df[[key]], , drop = FALSE]
+      new_df <- rbind(old[, names(new_df), drop = FALSE], new_df)
+    }
+  }
+  new_df[order(new_df[[key]]), , drop = FALSE]
+}
