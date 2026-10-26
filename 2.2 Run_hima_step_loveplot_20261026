@@ -1,0 +1,52 @@
+# ============================================================
+# 04_loveplot.R
+# Redraw / edit the covariate-balance Love plot for ONE Hima and
+# ONE matching round, directly from the saved balance table
+# (<tag>_balance_roundN.csv - no PSM re-run needed).
+# Usage: set HIMA_TAG and ROUND_N, then run this file.
+#   ROUND_N = NA  -> automatically uses the highest existing round
+# ============================================================
+
+MOD_DIR <- "E:/2 David Eldridge/1 Tasks-20260805/5 Results/0 20261020/run_hima_loop_audit_modules_V1-V8_20261020"
+source(file.path(MOD_DIR, "00_config_and_functions.R"))
+
+HIMA_TAG <- "V4_Hima_al-Ghada"   # <-- choose Hima here!!
+ROUND_N  <- NA                   # <-- Round for PSM；NA = MAX in round
+
+if (is.na(ROUND_N)) {
+  rounds_avail <- sub("_balance_round([0-9]+)\\.csv$", "\\1",
+                      list.files(out_dir, pattern = paste0("^", HIMA_TAG,
+                                                           "_balance_round[0-9]+\\.csv$")))
+  ROUND_N <- as.integer(max(as.integer(rounds_avail)))
+}
+bal_fp <- file.path(out_dir, paste0(HIMA_TAG, "_balance_round", ROUND_N, ".csv"))
+if (!file.exists(bal_fp)) stop("Balance table not found: ", bal_fp)
+
+bal <- read.csv(bal_fp, stringsAsFactors = FALSE)
+max_smd_a <- max(abs(bal$SMD_after[!bal$is_distance]), na.rm = TRUE)
+
+love <- bal %>%
+  select(variable, before = SMD_before, after = SMD_after) %>%
+  pivot_longer(cols = c(before, after), names_to = "stage", values_to = "SMD") %>%
+  mutate(stage = factor(stage, levels = c("before", "after"),
+                        labels = c("Before matching", "After matching")))
+
+p_love <- ggplot(love, aes(x = SMD, y = variable, group = variable)) +
+  geom_vline(xintercept = c(-SMD_OK, SMD_OK), linetype = "dashed", color = "grey40") +
+  geom_vline(xintercept = 0, color = "grey70") +
+  geom_line(color = "grey60") +
+  geom_point(aes(shape = stage, color = stage), size = 1.8) +
+  scale_color_manual(values = c("Before matching" = "#ff6600", "After matching" = "#002060")) +
+  scale_shape_manual(values = c("Before matching" = 1, "After matching" = 19)) +
+  labs(x = "Standardized mean difference", y = NULL,
+       title = paste0(HIMA_TAG, "  round ", ROUND_N, "  |  max|SMD| after = ",
+                      sprintf("%.3f", max_smd_a))) +
+  theme_bw(base_size = 9) +
+  theme(legend.title = element_blank(),
+        legend.position = "bottom",
+        panel.grid.minor = element_blank())
+
+ggsave(file.path(out_dir, paste0(HIMA_TAG, "_LovePlot_round", ROUND_N, ".png")),
+       plot = p_love, width = 12, height = max(5, 1.2 + 0.35 * nrow(bal)),
+       units = "cm", dpi = 400)
+message("[DONE] love plot saved: ", HIMA_TAG, "_LovePlot_round", ROUND_N, ".png")
