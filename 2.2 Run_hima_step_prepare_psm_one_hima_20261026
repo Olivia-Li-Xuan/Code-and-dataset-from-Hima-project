@@ -1,0 +1,463 @@
+# ============================================================
+# 01_prepare_psm_one_hima.R
+# Data prep + adaptive boundary + PSM (all rounds, with full
+# audit diagnostics) + report + barchart + map for ONE Hima.
+#
+# Usage : set HIMA_TAG below, then run this file.
+#         Works for any of V1-V8.
+#
+# Outputs (into out_dir = ".../5 Results/0 20261020"):
+#   <tag>_Matched_df.csv            matched pixels + weights
+#   <tag>_PS_scores.csv             propensity score of ALL filtered pixels
+#   <tag>_balance_roundN.csv        per-round balance table
+#   <tag>_LovePlot_roundN.png       per-round love plot
+#   <tag>_PSdistribution_roundN.png per-round PS distribution
+#   <tag>_PSM_audit_report.txt      full audit report
+#   <tag>_Barchart_MeanNPP.png      Inside/Outside NPP barchart
+#   <tag>_Matched_Map.png           matched-pixels map on landcover
+#   and updated rows in the shared tables:
+#   PSM_audit_rounds_all_Hima.csv / PSM_audit_final_summary.csv /
+#   Boundary_width_log.csv / Area_vs_NPPdiff_all_Hima.csv
+#   (existing rows of the same Hima are replaced, other Himas untouched)
+# ============================================================
+
+MOD_DIR <- "E:/2 David Eldridge/1 Tasks-20260805/5 Results/0 20261020/run_hima_loop_audit_modules_V1-V8_20261020"
+source(file.path(MOD_DIR, "00_config_and_functions.R"))
+
+HIMA_TAG <- "V4_Hima_al-Ghada"   # <-- 修改此行选择要运行的 Hima（V1-V8 均可）
+
+src <- build_src_list()[[HIMA_TAG]]
+if (is.null(src)) stop("No data source found for ", HIMA_TAG)
+tag <- HIMA_TAG
+
+audit_rounds <- list()
+
+res <- tryCatch({
+
+  message("=================================================")
+  message("Processing ", tag, " ...")
+  lf <- locate_files(src)
+  shp_file <- lf$shp_file; npp_file <- lf$npp_file; fac_dir <- lf$fac_dir
+
+  # ---------- 1. NPP raster ----------
+  r_npp    <- rast(npp_file)
+  data_all <- as.data.frame(r_npp, xy = TRUE, na.rm = TRUE)
+  colnames(data_all)[3] <- "NPP_Mean_2017_2025"
+  message("NPP pixels (non-NA): ", nrow(data_all))
+
+  # ---------- 2. covariates ----------
+  cov_files <- c(Aspect = lf$aspect_f, Elevation = lf$elev_f,
+                 Slope = lf$slope_f,  Landcover = lf$lc_f)
+  data_xy <- data_all[, c("x", "y")]
+  for (vn in names(cov_files)) {
+    r_env <- rast(cov_files[[vn]])
+    data_all[[vn]] <- terra::extract(r_env, as.matrix(data_xy))[[1]]
+  }
+  data_all <- data_all %>%
+    mutate(Northness = cos(Aspect * pi / 180),
+           Eastness  = sin(Aspect * pi / 180))
+  target_cols <- c("Elevation", "Slope", "Northness", "Eastness", "Landcover")
+  data_c <- data_all[complete.cases(data_all[, target_cols]), ]
+
+  # ---------- 3. zones ----------
+  hima_poly <- project(vect(shp_file), "EPSG:4326")
+
+  # ---------- 3a. adaptive boundary width & Hima area ----------
+  # narrowest width of the Hima (m); the boundary band on each side may not
+  # exceed 1/3 of that width. Default 100 m is kept unless the Hima is
+  # narrower than 3 * 100 m, in which case the band is reduced to width/3.
+  min_width_m   <- compute_min_width_m(hima_poly)
+  boundary_w_m  <- if (is.na(min_width_m)) 100 else min(100, min_width_m / 3)
+  hima_area_km2 <- expanse(hima_poly, unit = "km")
+  message(sprintf("[BOUNDARY] %s : narrowest width = %.1f m -> boundary band = %.1f m per side (%s)",
+                  tag, min_width_m, boundary_w_m,
+                  ifelse(boundary_w_m < 100, "REDUCED: Hima too narrow",
+                         "DEFAULT 100 m kept")))
+
+  lc_raster <- rast(lf$lc_f)
+  pts <- vect(data_c, geom = c("x", "y"), crs = "EPSG:4326")
+  data_c$Landcover_exact <- terra::extract(lc_raster, pts)[[2]]
+
+  hima_inner     <- buffer(hima_poly, width = -boundary_w_m)
+  hima_outer_min <- buffer(hima_poly, width =  boundary_w_m)
+  pts$zone <- "Exclude"
+  pts$zone[is.related(pts, hima_inner, "intersects")] <- "Inside"
+  pts$zone[!is.related(pts, hima_outer_min, "intersects")] <- "Outside"
+  data_c$zone <- pts$zone
+
+  # ---------- 4. filtering ----------
+  data_filtered <- data_c %>%
+    filter(zone %in% c("Inside", "Outside"),
+           !is.na(Landcover_exact),
+           Landcover_exact > 0, Landcover_exact <= 17,
+           !Landcover_exact %in% exclude_lc,
+           !is.na(NPP_Mean_2017_2025)) %>%
+    mutate(Landcover = Landcover_exact,
+           status    = ifelse(zone == "Inside", 1, 0))
+  n_tab <- table(data_filtered$status)
+  message("Filtered: Inside=", n_tab["1"], " Outside=", n_tab["0"])
+  if (min(n_tab) < 10) stop("Too few samples in one group; skip.")
+
+  # ---------- 5. STEP 1 review ----------
+  base_vars <- c("Elevation", "Slope", "Northness", "Eastness",
+                 "I(Elevation^2)", "I(Slope^2)")
+  review_lines <- review_design(data_filtered,
+                                ps_vars   = c("Elevation", "Slope", "Northness", "Eastness"),
+                                exact_var = "Landcover",
+                                treat_var = "status")
+  for (l in review_lines) message(l)
+
+  # ---------- 6. remediation sequence ----------
+  make_spec <- function(label, formula, caliper, ratio, replace, note) {
+    list(label = label,
+         formula = formula,
+         exact = ~Landcover,
+         method = "nearest", distance = "glm",
+         caliper = caliper, ratio = ratio, replace = replace,
+         note = note)
+  }
+  specs <- list(
+    make_spec("R1 baseline (original V3 specification)",
+              as.formula(paste("status ~", paste(base_vars, collapse = " + "))),
+              c(0.25, Slope = 0.3), 1, FALSE,
+              "squared terms for Elevation and Slope to absorb curvature"),
+    make_spec("R2 + interactions (remediation for residual imbalance)",
+              as.formula(paste("status ~", paste(c(base_vars,
+                   "Elevation:Slope", "Elevation:Northness", "Elevation:Eastness",
+                   "Slope:Northness", "Slope:Eastness"), collapse = " + "))),
+              c(0.25, Slope = 0.3), 1, FALSE,
+              "adds pairwise interactions: residual SMD after R1 indicates the PS is mis-specified in a non-additive way"),
+    make_spec("R3 + tighter caliper / ratio 2 / replace TRUE",
+              as.formula(paste("status ~", paste(c(base_vars,
+                   "Elevation:Slope", "Elevation:Northness", "Elevation:Eastness",
+                   "Slope:Northness", "Slope:Eastness"), collapse = " + "))),
+              c(0.20, Slope = 0.20), 2, TRUE,
+              "tighter caliper removes poor matches, ratio 2 adds controls to cut variance, replace=TRUE recovers dropped treated units (weights used in all comparisons)")
+  )
+
+  diags       <- list()
+  chosen_idx  <- NA
+  decision_log <- character(0)
+
+  for (i in 1:4) {
+
+    # round 4 is built on demand: a targeted, tighter caliper on exactly those
+    # covariates that are still unbalanced (usually Elevation / Slope)
+    if (i == 4) {
+      bad <- diags[[3]]$bad_vars
+      base_map <- c("I(Elevation^2)" = "Elevation", "I(Slope^2)" = "Slope")
+      bad[bad %in% names(base_map)] <- base_map[bad[bad %in% names(base_map)]]
+      bad <- intersect(unique(bad), c("Elevation", "Slope", "Northness", "Eastness"))
+      cal <- c(0.20)
+      for (bv in bad) cal <- c(cal, setNames(0.10, bv))
+      specs[[4]] <- make_spec(
+        paste0("R4 targeted caliper on unbalanced covariate(s): ",
+               paste(bad, collapse = ", ")),
+        specs[[3]]$formula, cal, 2, TRUE,
+        "variable-specific caliper of 0.10 SD is imposed on the covariates that remained unbalanced, on top of the interaction model")
+    }
+    sp <- specs[[i]]
+    message("---- matching round ", i, " : ", sp$label)
+    set.seed(123)
+    m <- matchit(formula = sp$formula, data = data_filtered,
+                 method = sp$method, distance = sp$distance,
+                 exact = sp$exact, caliper = sp$caliper,
+                 std.caliper = TRUE, replace = sp$replace, ratio = sp$ratio)
+    dg <- diagnose_match(m, tag, i, sp, out_dir)
+    diags[[i]] <- dg
+    txt <- diag_text(dg)
+    for (l in txt) message(l)
+    decision_log <- c(decision_log, txt, "")
+    audit_rounds[[paste(tag, i)]] <- data.frame(
+      Hima = tag, Round = i, Spec = sp$label,
+      Formula = paste(deparse(sp$formula), collapse = ""),
+      Method = sp$method, Distance = sp$distance,
+      Caliper = paste(sp$caliper, collapse = ","),
+      Ratio = sp$ratio, Replace = sp$replace,
+      MaxSMD_before = dg$max_smd_before, MaxSMD_after = dg$max_smd_after,
+      N_unbalanced = dg$n_bad_smd,
+      Unbalanced_vars = paste(dg$bad_vars, collapse = ";"),
+      VR_min = dg$vr_min, VR_max = dg$vr_max, N_bad_VR = dg$n_bad_vr,
+      Overlap_before = dg$overlap_before, Overlap_after = dg$overlap_after,
+      Pct_treated_in_support = 100 * dg$pct_in_support,
+      N_treated = dg$n_treated, N_control = dg$n_control,
+      N_matched = dg$n_matched,
+      Loss_treated_pct = 100 * dg$loss_treated,
+      Loss_control_pct = 100 * dg$loss_control,
+      Pass_SMD = dg$pass_smd, Pass_VR = dg$pass_vr,
+      Pass_loss = dg$pass_loss, Accepted = dg$pass_all,
+      Change_note = sp$note)
+
+    if (dg$pass_all) { chosen_idx <- i; break }
+
+    reason <- if (!dg$pass_smd) {
+      paste0("residual imbalance (", paste(dg$bad_vars, collapse = ", "),
+             "); PS model likely misses non-linear / interaction structure -> next round adds interaction terms")
+    } else if (!dg$pass_vr) {
+      "variance ratio outside 0.50-2.00 -> next round widens the control pool (ratio 2 / replace)"
+    } else {
+      "sample loss too high -> next round allows replacement of controls and ratio 2"
+    }
+    decision_log <- c(decision_log, sprintf("      ACTION : %s", reason), "")
+    message("      ACTION : ", reason)
+  }
+
+  # choose best round if none passed
+  if (is.na(chosen_idx)) {
+    scores <- sapply(diags, function(x) x$max_smd_after)
+    chosen_idx <- which.min(scores)
+    decision_log <- c(decision_log,
+      sprintf("      FINAL : no round met every criterion; round %d retained (lowest max|SMD| = %.3f). Limitation reported.",
+              chosen_idx, min(scores)), "")
+  } else {
+    decision_log <- c(decision_log,
+      sprintf("      FINAL : round %d accepted (all diagnostics passed).", chosen_idx), "")
+  }
+
+  dg_final <- diags[[chosen_idx]]
+  sp_final <- specs[[chosen_idx]]
+
+  # ---------- 7. final match data ----------
+  set.seed(123)
+  m_final <- matchit(formula = sp_final$formula, data = data_filtered,
+                     method = sp_final$method, distance = sp_final$distance,
+                     exact = sp_final$exact, caliper = sp_final$caliper,
+                     std.caliper = TRUE, replace = sp_final$replace,
+                     ratio = sp_final$ratio)
+  matched_df <- as.data.frame(match.data(m_final))
+  csv_out <- file.path(out_dir, paste0(tag, "_Matched_df.csv"))
+  if (requireNamespace("data.table", quietly = TRUE)) {
+    data.table::fwrite(matched_df, csv_out)
+  } else {
+    write.csv(matched_df, csv_out, row.names = FALSE)
+  }
+
+  # propensity score of every filtered pixel (for the PS-distribution module)
+  ps_out <- data.frame(status = data_filtered$status, distance = m_final$distance)
+  if (requireNamespace("data.table", quietly = TRUE)) {
+    data.table::fwrite(ps_out, file.path(out_dir, paste0(tag, "_PS_scores.csv")))
+  } else {
+    write.csv(ps_out, file.path(out_dir, paste0(tag, "_PS_scores.csv")), row.names = FALSE)
+  }
+
+  quality <- if (dg_final$pass_all) {
+    if (dg_final$max_smd_after < 0.05 && dg_final$overlap_after >= OVERLAP_OK) "EXCELLENT" else "GOOD"
+  } else if (dg_final$max_smd_after < 0.15) {
+    "ACCEPTABLE (minor residual imbalance, interpret with care)"
+  } else {
+    "POOR (substantial residual imbalance, do not interpret causally)"
+  }
+
+  # ---------- 7b. effect estimates (matching-weighted) ----------
+  # Computed BEFORE the audit report so the report can quote the
+  # Inside/Outside NPP difference. Matching weights are required whenever
+  # ratio > 1 or replace = TRUE (reused controls must not be double-counted).
+  matched_df$Zone <- factor(ifelse(matched_df$status == 1, "Inside", "Outside"),
+                            levels = c("Inside", "Outside"))
+  pixel_multiyear <- matched_df %>%
+    filter(!is.na(NPP_Mean_2017_2025), !is.na(weights), weights > 0) %>%
+    group_by(Zone) %>%
+    summarise(Mean_NPP = wmean(NPP_Mean_2017_2025, weights),
+              SD_NPP   = wsd(NPP_Mean_2017_2025, weights),
+              .groups  = "drop") %>%
+    mutate(ymin = Mean_NPP - SD_NPP, ymax = Mean_NPP + SD_NPP)
+
+  # ---------- 8. audit report (reproducible summary) ----------
+  rep_file <- file.path(out_dir, paste0(tag, "_PSM_audit_report.txt"))
+  writeLines(c(
+    "================================================================",
+    paste0("PSM AUDIT REPORT  --  ", tag),
+    paste0("Generated: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
+    "================================================================",
+    "",
+    review_lines,
+    "",
+    "---- 3. MATCHING ROUNDS AND DIAGNOSTICS -----------------------",
+    decision_log,
+    "---- 4. FINAL MODEL -------------------------------------------",
+    sprintf("  Accepted round      : %d (%s)", chosen_idx, sp_final$label),
+    sprintf("  PS formula          : %s", paste(deparse(sp_final$formula), collapse = "")),
+    sprintf("  exact / method / distance : %s / %s / %s",
+            paste(deparse(sp_final$exact), collapse = ""), sp_final$method, sp_final$distance),
+    sprintf("  caliper / ratio / replace : %s / %d / %s",
+            paste(sp_final$caliper, collapse = ", "), sp_final$ratio, sp_final$replace),
+    sprintf("  max |SMD| after     : %.3f  (target < 0.10)", dg_final$max_smd_after),
+    sprintf("  variance ratio      : %.2f - %.2f  (target 0.50-2.00)", dg_final$vr_min, dg_final$vr_max),
+    sprintf("  PS overlap after    : %.2f", dg_final$overlap_after),
+    sprintf("  matched sample      : %d (treated kept %.1f%%, control kept %.1f%%)",
+            dg_final$n_matched, 100 * (1 - dg_final$loss_treated),
+            100 * (1 - dg_final$loss_control)),
+    sprintf("  MATCHING QUALITY    : %s", quality),
+    sprintf("  Hima area (polygon)  : %.1f km^2", hima_area_km2),
+    sprintf("  Narrowest width      : %.1f m", min_width_m),
+    sprintf("  Boundary band used   : %.1f m per side (default 100 m; capped at 1/3 of narrowest width%s)",
+            boundary_w_m, ifelse(boundary_w_m < 100, ", REDUCED", "")),
+    sprintf("  NPP diff (Inside-Outside) : %.3f g C m-2 yr-1",
+            pixel_multiyear$Mean_NPP[1] - pixel_multiyear$Mean_NPP[2]),
+    "  estimator           : weighted by matching weights (treated weight = 1; controls",
+    "                        weighted to the treated group; p-value from weighted lm)",
+    "",
+    "Artefacts: <tag>_balance_round*.csv (SMD & variance ratio table),",
+    "           <tag>_LovePlot_round*.png, <tag>_PSdistribution_round*.png,",
+    "           <tag>_Matched_df.csv"),
+    rep_file)
+
+  # ---------- 9. barchart from the final match ----------
+  # (pixel_multiyear already computed above; see module 02 to redraw/edit it)
+  fit_w <- lm(NPP_Mean_2017_2025 ~ Zone, data = matched_df, weights = weights)
+  p_val <- summary(fit_w)$coefficients["ZoneOutside", "Pr(>|t|)"]
+  p_lab <- dplyr::case_when(p_val < 0.001 ~ "***", p_val < 0.01 ~ "**",
+                            p_val < 0.05 ~ "*", TRUE ~ "ns")
+  message(sprintf("Mean NPP Inside=%.2f Outside=%.2f  p=%.3g (%s)",
+                  pixel_multiyear$Mean_NPP[1], pixel_multiyear$Mean_NPP[2], p_val, p_lab))
+
+  y_top <- max(pixel_multiyear$ymax, na.rm = TRUE)
+  stat_overall <- data.frame(x_pos = 1.5, y_position = y_top * 1.06, label = p_lab)
+  lab_df <- pixel_multiyear %>%
+    mutate(lab = sprintf("%.2f", Mean_NPP), lab_y = ymax * 1.02)
+
+  p_overall <- ggplot(pixel_multiyear, aes(x = Zone, y = Mean_NPP, fill = Zone, color = Zone)) +
+    geom_col(width = 0.5, alpha = 0.85) +
+    geom_text(data = lab_df, aes(x = Zone, y = lab_y, label = lab),
+              inherit.aes = FALSE, color = "black", size = 2.5, fontface = "bold") +
+    geom_errorbar(aes(ymin = ymin, ymax = ymax), width = 0.15,
+                  linewidth = 0.4, color = "black", alpha = 0.8) +
+    geom_text(data = stat_overall, aes(x = x_pos, y = y_position, label = label),
+              inherit.aes = FALSE, size = 3, fontface = "bold", color = "black") +
+    scale_color_manual(values = c("Inside" = "#002060", "Outside" = "#ff6600")) +
+    scale_fill_manual(values  = c("Inside" = "#002060", "Outside" = "#ff6600")) +
+    labs(x = NULL,
+         y = expression(paste("Net Primary Productivity (g C m"^-2, " yr"^-1, ")")),
+         title = NULL) +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_line(color = "grey92", linewidth = 0.1, linetype = "dashed"),
+          axis.text.x = element_text(color = "black", size = 6, face = "bold"),
+          axis.text.y = element_text(color = "black", size = 5),
+          axis.title  = element_text(color = "black", size = 5, face = "bold"),
+          legend.position = "none")
+  ggsave(file.path(out_dir, paste0(tag, "_Barchart_MeanNPP.png")),
+         plot = p_overall, width = 8, height = 5, units = "cm", dpi = 600)
+
+  # ---------- 10. map from the final match ----------
+  # (see module 03 to redraw/edit it)
+  pts2 <- vect(matched_df, geom = c("x", "y"), crs = "EPSG:4326")
+  crop_ext <- ext(pts2)
+  crop_ext$xmin <- crop_ext$xmin - 0.01; crop_ext$xmax <- crop_ext$xmax + 0.01
+  crop_ext$ymin <- crop_ext$ymin - 0.01; crop_ext$ymax <- crop_ext$ymax + 0.01
+  landcover_crop <- crop(lc_raster, crop_ext)
+
+  matched_df$bg_lc_val <- terra::extract(landcover_crop, pts2)[[2]]
+  matched_df_clean <- matched_df %>%
+    filter(!is.na(bg_lc_val) & bg_lc_val > 0 & bg_lc_val <= 17)
+
+  lc_df <- as.data.frame(landcover_crop, xy = TRUE, na.rm = TRUE)
+  colnames(lc_df) <- c("x", "y", "landcover")
+  lc_df <- lc_df %>% filter(!is.na(landcover) & landcover > 0 & landcover <= 17)
+  lc_df$landcover_name <- lc_labels[as.character(lc_df$landcover)]
+  present_levels <- intersect(unname(lc_labels), unique(lc_df$landcover_name))
+  lc_df$landcover_name <- factor(lc_df$landcover_name, levels = present_levels)
+
+  matched_sf <- st_as_sf(matched_df_clean, coords = c("x", "y"), crs = 4326) %>%
+    mutate(Group = factor(status, levels = c(1, 0), labels = c("Inside", "Outside")))
+  hima_sf <- st_as_sf(hima_poly)
+
+  p_map_lc <- ggplot() +
+    geom_raster(data = lc_df, aes(x = x, y = y, fill = landcover_name), alpha = 0.45) +
+    scale_fill_manual(values = lc_colors, name = NULL,
+                      na.value = "transparent", na.translate = FALSE) +
+    geom_sf(data = hima_sf, fill = NA, color = "#a50f15", linewidth = 0.8) +
+    geom_sf(data = matched_sf, aes(color = Group), size = 0.1, alpha = 0.45) +
+    scale_color_manual(name = NULL,
+                       values = c("Inside" = "#002060", "Outside" = "#ff6600")) +
+    ggspatial::annotation_scale(location = "bl", height = unit(0.1, "cm"),
+                                text_cex = 0.5, line_width = 0.2,
+                                bar_cols = c("white", "gray80")) +
+    ggspatial::annotation_north_arrow(location = "tr", which_north = "true",
+                                      height = unit(0.25, "cm"), width = unit(0.25, "cm"),
+                                      pad_x = unit(0.2, "in"), pad_y = unit(0.2, "in"),
+                                      style = ggspatial::north_arrow_orienteering(text_size = 3)) +
+    coord_sf(crs = 4326, expand = FALSE) +
+    labs(x = "Longitude (E)", y = "Latitude (N)") +
+    theme_bw(base_size = 12) +
+    theme(plot.title = element_blank(), legend.position = c(0.1, 0.15),
+          legend.background = element_rect(), legend.title = element_blank(),
+          legend.text = element_text(size = 4),
+          legend.key.height = unit(0.2, "cm"), legend.key.width = unit(0.3, "cm"),
+          legend.box = "vertical", legend.spacing.y = unit(-0.15, "cm"),
+          legend.box.spacing = unit(0.01, "cm"),
+          legend.box.margin = margin(0, 0, 0, 0, unit = "cm"),
+          panel.grid.major = element_line(color = "gray80", linetype = "dotted"),
+          axis.title = element_blank(), axis.text.x = element_text(size = 5),
+          axis.text.y = element_text(size = 5, angle = 90, hjust = 0.5)) +
+    guides(color = guide_legend(override.aes = list(size = 2)))
+  ggsave(file.path(out_dir, paste0(tag, "_Matched_Map.png")),
+         plot = p_map_lc, width = 11.5, height = 12.5, units = "cm", dpi = 600)
+
+  list(Hima = tag, ok = TRUE, Round_used = chosen_idx,
+       Spec = sp_final$label, MaxSMD_after = dg_final$max_smd_after,
+       VR_min = dg_final$vr_min, VR_max = dg_final$vr_max,
+       Overlap_after = dg_final$overlap_after,
+       Loss_treated_pct = 100 * dg_final$loss_treated,
+       N_matched = dg_final$n_matched,
+       Mean_Inside = pixel_multiyear$Mean_NPP[1],
+       Mean_Outside = pixel_multiyear$Mean_NPP[2],
+       Diff_Inside_minus_Outside = pixel_multiyear$Mean_NPP[1] - pixel_multiyear$Mean_NPP[2],
+       Area_km2 = hima_area_km2,
+       Narrowest_width_m = min_width_m, Boundary_band_m = boundary_w_m,
+       Boundary_reduced = boundary_w_m < 100,
+       P_value = p_val, Signif = p_lab, Quality = quality)
+},
+error = function(e) {
+  message("ERROR in ", tag, ": ", conditionMessage(e))
+  list(Hima = tag, ok = FALSE, Error = conditionMessage(e))
+})
+
+# ---------- update the shared summary tables (merge, never erase) ----------
+if (length(audit_rounds)) {
+  rounds_df <- do.call(rbind, audit_rounds)
+  rounds_df <- merge_with_existing(rounds_df, "PSM_audit_rounds_all_Hima.csv")
+  rounds_df <- rounds_df[order(rounds_df$Hima, rounds_df$Round), ]
+  write.csv(rounds_df, file.path(out_dir, "PSM_audit_rounds_all_Hima.csv"), row.names = FALSE)
+}
+
+if (isTRUE(res$ok)) {
+  fin <- data.frame(Hima = res$Hima, Round_used = res$Round_used, Spec = res$Spec,
+                    MaxSMD_after = round(res$MaxSMD_after, 3),
+                    VR_min = round(res$VR_min, 2), VR_max = round(res$VR_max, 2),
+                    Overlap_after = round(res$Overlap_after, 2),
+                    Loss_treated_pct = round(res$Loss_treated_pct, 1),
+                    N_matched = res$N_matched,
+                    Mean_Inside = round(res$Mean_Inside, 2),
+                    Mean_Outside = round(res$Mean_Outside, 2),
+                    Diff_Inside_minus_Outside = round(res$Diff_Inside_minus_Outside, 3),
+                    Area_km2 = round(res$Area_km2, 2),
+                    Narrowest_width_m = round(res$Narrowest_width_m, 1),
+                    Boundary_band_m = round(res$Boundary_band_m, 1),
+                    Boundary_reduced = res$Boundary_reduced,
+                    P_value = signif(res$P_value, 3), Signif = res$Signif,
+                    Quality = res$Quality)
+  fin <- merge_with_existing(fin, "PSM_audit_final_summary.csv")
+  write.csv(fin, file.path(out_dir, "PSM_audit_final_summary.csv"), row.names = FALSE)
+
+  bnd <- data.frame(Hima = res$Hima, Area_km2 = round(res$Area_km2, 2),
+                    Narrowest_width_m = round(res$Narrowest_width_m, 1),
+                    Boundary_band_m = round(res$Boundary_band_m, 1),
+                    Boundary_reduced = res$Boundary_reduced,
+                    stringsAsFactors = FALSE)
+  bnd <- merge_with_existing(bnd, "Boundary_width_log.csv")
+  write.csv(bnd, file.path(out_dir, "Boundary_width_log.csv"), row.names = FALSE)
+
+  cross <- data.frame(Hima = res$Hima, Area_km2 = res$Area_km2,
+                      Mean_Inside = res$Mean_Inside, Mean_Outside = res$Mean_Outside,
+                      Diff_Inside_minus_Outside = res$Mean_Inside - res$Mean_Outside,
+                      N_matched = res$N_matched, stringsAsFactors = FALSE)
+  cross <- merge_with_existing(cross, "Area_vs_NPPdiff_all_Hima.csv")
+  write.csv(cross, file.path(out_dir, "Area_vs_NPPdiff_all_Hima.csv"), row.names = FALSE)
+
+  message("[DONE] ", tag, " processed; shared summary tables updated.")
+} else {
+  message("[FAILED] ", tag, ": ", res$Error)
+}
+
+gc()
