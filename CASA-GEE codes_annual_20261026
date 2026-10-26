@@ -1,34 +1,40 @@
-var geometry = ee.Geometry.Polygon(
-    [[[35.76991866528064, 32.29702463078525],
-      [35.76991866528064, 31.90031966065995],
-      [36.26705001293689, 31.90031966065995],
-      [36.26705001293689, 32.29702463078525]]], null, false);
+var geom = geometry.geometry();
 
-Map.centerObject(geometry, 11);
+var areaScaleFactor = 5;
 
-Map.addLayer(
-  geometry,
-  {color: 'FF0000'},
-  'Study area geometry'
-);
+var origCentroid = geom.centroid(1);
+var origArea = geom.area(1);
 
+var targetArea = origArea.multiply(areaScaleFactor);
+var sideLength = targetArea.sqrt();
+var halfSide = sideLength.divide(2);
 
-var startYear = 2014;
+var studyArea = origCentroid.buffer(halfSide, 1).bounds(1);
+
+print('Original Area (sq km):', origArea.divide(1e6));
+print('Expanded Square Area (sq km):', studyArea.area(1).divide(1e6));
+print('Actual Area Scale Factor:', studyArea.area(1).divide(origArea));
+print('Is original SHP contained?:', studyArea.contains(geom, 1));
+
+Map.centerObject(studyArea, 10);
+
+Map.addLayer(studyArea, {color: '0000FF'}, 'Expanded Square Study Area (' + areaScaleFactor + 'x)');
+Map.addLayer(geometry, {color: 'FF0000'}, 'Original SHP Boundary');
+
+var startYear = 2017;
 var endYear = 2025;
 
 var landsatScale = 30;
 
 var PAR_fraction = 0.47;
 
-
 var landsatCollection = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
   .merge(ee.ImageCollection("LANDSAT/LC09/C02/T1_L2"))
-  .filterBounds(geometry);
-
+  .filterBounds(studyArea);
 
 function maskLandsatC2(image){
   var qa = image.select('QA_PIXEL');
-  
+
   var cloudMask = qa.bitwiseAnd(1 << 1).eq(0)
     .and(qa.bitwiseAnd(1 << 3).eq(0))
     .and(qa.bitwiseAnd(1 << 4).eq(0))
@@ -51,13 +57,11 @@ function maskLandsatC2(image){
     .copyProperties(image, ['system:time_start', 'LANDSAT_PRODUCT_ID']);
 }
 
-
 var landsatSR = landsatCollection
   .map(maskLandsatC2)
   .filter(ee.Filter.calendarRange(startYear, endYear, 'year'));
 
 print('Processed Landsat collection', landsatSR);
-
 
 function addNDVI(image){
   var ndvi = image.normalizedDifference(['NIR', 'Red']).rename('NDVI');
@@ -66,29 +70,31 @@ function addNDVI(image){
 
 var landsatNDVI = landsatSR.map(addNDVI);
 
-
-
 var era5Monthly = ee.ImageCollection("ECMWF/ERA5_LAND/MONTHLY_AGGR")
-  .filterBounds(geometry)
+  .filterBounds(studyArea)
   .filter(ee.Filter.calendarRange(startYear, endYear, 'year'));
 
+var modisLC = ee.ImageCollection("MODIS/061/MCD12Q1")
+  .filter(ee.Filter.calendarRange(startYear, endYear, 'year'))
+  .select('LC_Type1');
 
-var worldCover = ee.ImageCollection("ESA/WorldCover/v200")
-  .first()
-  .select('Map')
-  .clip(geometry);
+var isUnchanged = modisLC.reduce(ee.Reducer.countDistinct()).eq(1);
 
+var unchangedLandCover = modisLC.mode()
+  .updateMask(isUnchanged)
+  .clip(studyArea);
 
-var Topt = ee.Image(20)
-  .where(worldCover.eq(10), 25)
-  .where(worldCover.eq(20), 22)
-  .where(worldCover.eq(30), 20)
-  .where(worldCover.eq(40), 22)
-  .where(worldCover.eq(50), 20)
-  .where(worldCover.eq(60), 18)
-  .where(worldCover.eq(90), 24)
+var Topt = ee.Image(0)
+  .where(unchangedLandCover.gte(1).and(unchangedLandCover.lte(5)), 25)
+  .where(unchangedLandCover.gte(6).and(unchangedLandCover.lte(7)), 22)
+  .where(unchangedLandCover.gte(8).and(unchangedLandCover.lte(9)), 23)
+  .where(unchangedLandCover.eq(10), 20)
+  .where(unchangedLandCover.eq(11), 24)
+  .where(unchangedLandCover.eq(12), 22)
+  .where(unchangedLandCover.eq(13), 20)
+  .where(unchangedLandCover.eq(14), 22)
+  .where(unchangedLandCover.eq(16), 18)
   .rename('Topt');
-
 
 function monthlyNDVI(year, month){
   var start = ee.Date.fromYMD(year, month, 1);
@@ -104,7 +110,7 @@ function monthlyNDVI(year, month){
     ee.Algorithms.If(
       count.gt(0),
       monthlyCollection.median().rename('NDVI'),
-      ee.Image().rename('NDVI')
+      ee.Image.constant(0).rename('NDVI').updateMask(ee.Image(0))
     )
   );
 
@@ -115,7 +121,6 @@ function monthlyNDVI(year, month){
     'image_count': count
   });
 }
-
 
 var years = ee.List.sequence(startYear, endYear);
 var months = ee.List.sequence(1, 12);
@@ -128,14 +133,12 @@ var monthlyNDVICollection = ee.ImageCollection(
   }).flatten()
 );
 
-
 var ndviPercentile = monthlyNDVICollection
   .select('NDVI')
   .reduce(ee.Reducer.percentile([5, 95]));
 
 var NDVImin = ndviPercentile.select('NDVI_p5');
 var NDVImax = ndviPercentile.select('NDVI_p95');
-
 
 function calculateFPAR(image){
   var ndvi = image.select('NDVI');
@@ -152,7 +155,6 @@ function calculateFPAR(image){
 }
 
 var monthlyFPAR = monthlyNDVICollection.map(calculateFPAR);
-
 
 function monthlyPAR(image){
   var date = ee.Date(image.get('system:time_start'));
@@ -174,7 +176,6 @@ function monthlyPAR(image){
 }
 
 var monthlyPARCollection = monthlyFPAR.map(monthlyPAR);
-
 
 function temperatureStress(image){
   var date = ee.Date(image.get('system:time_start'));
@@ -209,7 +210,6 @@ function temperatureStress(image){
 
 var monthlyTStress = monthlyPARCollection.map(temperatureStress);
 
-
 function waterStress(image){
   var date = ee.Date(image.get('system:time_start'));
 
@@ -230,29 +230,18 @@ function waterStress(image){
 
 var monthlyStress = monthlyTStress.map(waterStress);
 
-
-
-var worldCoverMod3 = ee.ImageCollection("ESA/WorldCover/v200")
-  .first()
-  .select('Map')
-  .clip(geometry);
-
-
 var epsilonMax = ee.Image(0)
-  .where(worldCoverMod3.eq(10), 0.80)
-  .where(worldCoverMod3.eq(20), 0.45)
-  .where(worldCoverMod3.eq(30), 0.55)
-  .where(worldCoverMod3.eq(40), 0.55)
-  .where(worldCoverMod3.eq(50), 0.05)
-  .where(worldCoverMod3.eq(60), 0.05)
-  .where(worldCoverMod3.eq(70), 0)
-  .where(worldCoverMod3.eq(80), 0)
-  .where(worldCoverMod3.eq(90), 0.60)
-  .where(worldCoverMod3.eq(95), 0.80)
-  .where(worldCoverMod3.eq(100), 0.20)
+  .where(unchangedLandCover.gte(1).and(unchangedLandCover.lte(5)), 0.80)
+  .where(unchangedLandCover.gte(6).and(unchangedLandCover.lte(7)), 0.45)
+  .where(unchangedLandCover.gte(8).and(unchangedLandCover.lte(9)), 0.50)
+  .where(unchangedLandCover.eq(10), 0.55)
+  .where(unchangedLandCover.eq(11), 0.60)
+  .where(unchangedLandCover.eq(12), 0.55)
+  .where(unchangedLandCover.eq(13), 0.05)
+  .where(unchangedLandCover.eq(14), 0.55)
+  .where(unchangedLandCover.eq(16), 0.05)
   .rename('epsilonMax')
-  .clip(geometry);
-
+  .clip(studyArea);
 
 function calculateMonthlyNPP(image){
   var par = image.select('PAR');
@@ -271,7 +260,6 @@ function calculateMonthlyNPP(image){
 }
 
 var monthlyNPP = monthlyStress.map(calculateMonthlyNPP);
-
 
 function annualNPP(year){
   year = ee.Number(year);
@@ -295,29 +283,26 @@ function annualNPP(year){
   });
 }
 
-
 var annualNPPCollection = ee.ImageCollection(years.map(annualNPP));
-
-print('Annual NPP Collection (2014-2025):', annualNPPCollection);
-
-
-var npp2024 = annualNPPCollection
-  .filter(ee.Filter.eq('year', 2024))
-  .first();
+var meanNPP = annualNPPCollection.select('NPP').mean().rename('NPP_mean');
 
 Map.addLayer(
-  npp2024,
+  meanNPP,
   {min: 0, max: 500, palette: ['ffffff', 'ffff00', '008000']},
-  'CASA NPP 2024'
+  'CASA Mean NPP Check'
 );
 
+for (var y = startYear; y <= endYear; y++) {
+  var annualImg = annualNPP(y).clip(studyArea);
 
-years.evaluate(function(yearList){
-  yearList.forEach(function(year){
-    var image = annualNPPCollection
-      .filter(ee.Filter.eq('year', year))
-      .first();
-
-  
+  Export.image.toDrive({
+    image: annualImg,
+    description: 'Hima_V1_NPP_Annual_' + y,
+    folder: 'Hima_V1_NPP_Exports',
+    fileNamePrefix: 'Hima_V1_NPP_Annual_' + y,
+    region: studyArea,
+    scale: landsatScale,
+    crs: 'EPSG:4326',
+    maxPixels: 1e13
   });
-});
+}
