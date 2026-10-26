@@ -1,0 +1,56 @@
+# ============================================================
+# 05_psdistribution.R
+# Redraw / edit the propensity-score distribution plot (before vs
+# after matching) for ONE Hima, from the saved PS scores
+# (<tag>_PS_scores.csv = every filtered pixel) and the saved
+# matched pixels (<tag>_Matched_df.csv, weights > 0 = after).
+# No PSM re-run needed.
+#
+# Note: per-ROUND versions of this figure are produced automatically
+# by module 01 while matching; this module redraws the FINAL match.
+# Usage: set HIMA_TAG, then run this file.
+# ============================================================
+
+MOD_DIR <- "E:/2 David Eldridge/1 Tasks-20260805/5 Results/0 20261020/run_hima_loop_audit_modules_V1-V8_20261020"
+source(file.path(MOD_DIR, "00_config_and_functions.R"))
+
+HIMA_TAG <- "V4_Hima_al-Ghada"   # <-- choose Hima here!!
+
+ps_fp <- file.path(out_dir, paste0(HIMA_TAG, "_PS_scores.csv"))
+if (!file.exists(ps_fp))
+  stop("PS scores not found (", ps_fp, "). Run module 01 for this Hima first.")
+
+ps_all      <- read.csv(ps_fp, stringsAsFactors = FALSE)      # all filtered pixels
+matched_df  <- read.csv(file.path(out_dir, paste0(HIMA_TAG, "_Matched_df.csv")),
+                        stringsAsFactors = FALSE)             # final match
+
+ps_before <- ps_all$distance
+tt_before <- ps_all$status == 1
+keep_after <- matched_df$weights > 0 & !is.na(matched_df$weights)
+ps_after  <- matched_df$distance[keep_after]
+tt_after  <- matched_df$status[keep_after] == 1
+
+ov_before <- overlap_coef(ps_before[tt_before], ps_before[!tt_before])
+ov_after  <- overlap_coef(ps_after[tt_after],  ps_after[!tt_after])
+
+samp <- function(x, k = 200000) if (length(x) > k) sample(x, k) else x
+ps_df <- rbind(
+  data.frame(stage = "Before matching", ps = samp(ps_before[tt_before]), group = "Inside"),
+  data.frame(stage = "Before matching", ps = samp(ps_before[!tt_before]), group = "Outside"),
+  data.frame(stage = "After matching",  ps = samp(ps_after[tt_after]),   group = "Inside"),
+  data.frame(stage = "After matching",  ps = samp(ps_after[!tt_after]),  group = "Outside"))
+
+p_ps <- ggplot(ps_df, aes(x = ps, fill = group)) +
+  geom_density(alpha = 0.45, color = NA) +
+  facet_wrap(~ stage, scales = "free_y") +
+  scale_fill_manual(values = c("Inside" = "#002060", "Outside" = "#ff6600")) +
+  labs(x = "Propensity score", y = "Density",
+       title = paste0(HIMA_TAG, "  final match",
+                      "  |  overlap before = ", sprintf("%.2f", ov_before),
+                      "   overlap after = ", sprintf("%.2f", ov_after))) +
+  theme_bw(base_size = 9) +
+  theme(legend.title = element_blank(), panel.grid.minor = element_blank())
+
+ggsave(file.path(out_dir, paste0(HIMA_TAG, "_PSdistribution_final.png")),
+       plot = p_ps, width = 14, height = 7, units = "cm", dpi = 400)
+message("[DONE] PS distribution saved: ", HIMA_TAG, "_PSdistribution_final.png")
